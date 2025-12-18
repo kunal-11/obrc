@@ -1,7 +1,7 @@
 package main
 
-func mergeMaps(maps []map[string]*CityTotal) map[string]*CityTotal {
-	result := make(map[string]*CityTotal)
+func mergeMaps(maps []map[string]*jobResult) map[string]*jobResult {
+	result := make(map[string]*jobResult)
 	for _, m := range maps {
 		for k, v := range m {
 			if cur, ok := result[k]; ok {

@@ -137,7 +137,7 @@ func (j *job) worker(result map[string]*jobResult) {
 			name := buf[i:j]
 			i = j + 1
 
-			// parse tempaerature
+			// parse temperature
 			num := 0
 			sign := 1
 			if buf[i] == '-' {

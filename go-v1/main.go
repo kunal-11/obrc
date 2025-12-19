@@ -1,12 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -32,26 +33,26 @@ func main() {
 		workers: runtime.NumCPU(),
 	}
 	j.run()
-
 	result := mergeMaps(j.results)
 
-	keys := make([]string, 0, len(result))
+	keys := make([]uint64, 0, len(result))
 	for k := range result {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.SortFunc(keys, func(l, r uint64) int {
+		return bytes.Compare(result[l].name, result[r].name)
+	})
 	fmt.Print("{")
 	for _, city := range keys {
 		score := result[city]
-		mean := score.sum / int64(score.count)
-		fmt.Printf("%v=%v/%v/%v, ", city, float32(score.min)/10, float32(mean)/10, float32(score.max)/10)
+		fmt.Printf("%s=%v/%v/%v, ", score.name, float32(score.min)/10, float32(score.sum/int64(score.count))/10, float32(score.max)/10)
 	}
 	fmt.Print("}")
 }
 
-func mergeMaps(maps []map[string]*jobResult) map[string]*jobResult {
-	res := make(map[string]*jobResult, 1024*8)
-	for _, m := range maps {
+func mergeMaps(maps []map[uint64]*jobResult) map[uint64]*jobResult {
+	res := maps[0]
+	for _, m := range maps[1:] {
 		for k, v := range m {
 			val, ok := res[k]
 			if !ok {
@@ -74,14 +75,16 @@ type job struct {
 	workers int
 
 	channel chan []byte
-	results []map[string]*jobResult
+	results []map[uint64]*jobResult
 }
 
 type jobResult struct {
 	sum   int64
 	count int
-	min   int
-	max   int
+	min   int16
+	max   int16
+
+	name []byte
 }
 
 func (j *job) run() {
@@ -93,7 +96,7 @@ func (j *job) run() {
 
 	wg := sync.WaitGroup{}
 	for range j.workers {
-		result := make(map[string]*jobResult, 1024*8)
+		result := make(map[uint64]*jobResult, 1024*8)
 		j.results = append(j.results, result)
 		wg.Add(1)
 		go func() {
@@ -125,47 +128,55 @@ func (j *job) reader() {
 	}
 }
 
-func (j *job) worker(result map[string]*jobResult) {
+const (
+	// FNV-1 64-bit prime and offset basis
+	FNVPrime  uint64 = 1099511628211
+	FNVOffset uint64 = 14695981039346656037
+)
+
+func (j *job) worker(result map[uint64]*jobResult) {
 	for buf := range j.channel {
-		for i := 0; i < len(buf); {
+		for i := 0; i < len(buf); i++ {
 			// parse city name
 			j := i
+			h := FNVOffset
 			for buf[j] != ';' {
+				h ^= uint64(buf[j])
+				h *= FNVPrime
 				j++
 			}
-			name := buf[i:j]
+
+			// update map
+			cur, ok := result[h]
+			if !ok {
+				cur = &jobResult{
+					max:  -1000,
+					min:  1000,
+					name: buf[i:j],
+				}
+				result[h] = cur
+			}
 			i = j + 1
 
 			// parse temperature
-			num := 0
-			sign := 1
+			num := int16(0)
+			sign := int16(1)
 			if buf[i] == '-' {
 				sign = -1
 				i++
 			}
 			for buf[i] != '\n' {
 				if buf[i] != '.' {
-					num = num*10 + int(buf[i]-'0')
+					num = num*10 + int16(buf[i]-'0')
 				}
 				i++
 			}
-			temp := num * sign
-			i++
-
-			// update map
-			cur, ok := result[string(name)]
-			if !ok {
-				cur = &jobResult{
-					max: temp,
-					min: temp,
-				}
-				result[string(name)] = cur
-			}
+			num *= sign
 
 			cur.count += 1
-			cur.sum += int64(temp)
-			cur.max = max(cur.max, temp)
-			cur.min = min(cur.min, temp)
+			cur.sum += int64(num)
+			cur.max = max(cur.max, num)
+			cur.min = min(cur.min, num)
 		}
 	}
 }

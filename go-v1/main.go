@@ -75,7 +75,6 @@ type job struct {
 
 	channel chan []byte
 	results []map[string]*jobResult
-	wg      *sync.WaitGroup
 }
 
 type jobResult struct {

@@ -40,7 +40,6 @@ func main() {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-
 	fmt.Print("{")
 	for _, city := range keys {
 		score := result[city]
@@ -51,7 +50,7 @@ func main() {
 }
 
 func mergeMaps(maps []map[string]*jobResult) map[string]*jobResult {
-	res := make(map[string]*jobResult, 128)
+	res := make(map[string]*jobResult, 1024*8)
 	for _, m := range maps {
 		for k, v := range m {
 			val, ok := res[k]
@@ -95,7 +94,7 @@ func (j *job) run() {
 
 	wg := sync.WaitGroup{}
 	for range j.workers {
-		result := make(map[string]*jobResult, 32)
+		result := make(map[string]*jobResult, 1024*8)
 		j.results = append(j.results, result)
 		wg.Add(1)
 		go func() {
@@ -129,49 +128,45 @@ func (j *job) reader() {
 
 func (j *job) worker(result map[string]*jobResult) {
 	for buf := range j.channel {
-		parseBuffer(buf, result)
-	}
-}
+		for i := 0; i < len(buf); {
+			// parse city name
+			j := i
+			for buf[j] != ';' {
+				j++
+			}
+			name := buf[i:j]
+			i = j + 1
 
-func parseBuffer(buf []byte, result map[string]*jobResult) {
-	for i := 0; i < len(buf); {
-		j := parseName(buf, i)
-		name := buf[i:j]
-		temp, j := parseTemp(buf, j+1)
-		i = j + 1
+			// parse tempaerature
+			num := 0
+			sign := 1
+			if buf[i] == '-' {
+				sign = -1
+				i++
+			}
+			for buf[i] != '\n' {
+				if buf[i] != '.' {
+					num = num*10 + int(buf[i]-'0')
+				}
+				i++
+			}
+			temp := num * sign
+			i++
 
-		cur, ok := result[string(name)]
-		if !ok {
-			cur = &jobResult{}
-			result[string(name)] = cur
+			// update map
+			cur, ok := result[string(name)]
+			if !ok {
+				cur = &jobResult{
+					max: temp,
+					min: temp,
+				}
+				result[string(name)] = cur
+			}
+
+			cur.count += 1
+			cur.sum += int64(temp)
+			cur.max = max(cur.max, temp)
+			cur.min = min(cur.min, temp)
 		}
-
-		cur.count += 1
-		cur.sum += int64(temp)
-		cur.max = max(cur.max, temp)
-		cur.min = min(cur.min, temp)
 	}
-}
-
-func parseName(buf []byte, i int) int {
-	for buf[i] != ';' {
-		i++
-	}
-	return i
-}
-
-func parseTemp(buf []byte, i int) (int, int) {
-	num := 0
-	sign := 1
-	if buf[i] == '-' {
-		sign = -1
-		i++
-	}
-	for buf[i] != '\n' {
-		if buf[i] != '.' {
-			num = num*10 + int(buf[i]-'0')
-		}
-		i++
-	}
-	return num * sign, i
 }

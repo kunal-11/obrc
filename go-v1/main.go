@@ -1,15 +1,23 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
 	"runtime/pprof"
 	"slices"
+	"strings"
 	"sync"
 )
+
+const BUF_LEN = 1024 * 1024 * 4
+
+var bufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, BUF_LEN)
+	},
+}
 
 func main() {
 	f, err := os.Create("./profdata")
@@ -29,7 +37,6 @@ func main() {
 
 	j := job{
 		file:    file,
-		bufLen:  1024 * 1024 * 32,
 		workers: runtime.NumCPU(),
 	}
 	j.run()
@@ -40,7 +47,7 @@ func main() {
 		keys = append(keys, k)
 	}
 	slices.SortFunc(keys, func(l, r uint64) int {
-		return bytes.Compare(result[l].name, result[r].name)
+		return strings.Compare(result[l].name, result[r].name)
 	})
 	fmt.Print("{")
 	for _, city := range keys {
@@ -71,7 +78,6 @@ func mergeMaps(maps []map[uint64]*jobResult) map[uint64]*jobResult {
 type job struct {
 	// Options
 	file    *os.File
-	bufLen  int64
 	workers int
 
 	channel chan []byte
@@ -84,16 +90,17 @@ type jobResult struct {
 	min   int16
 	max   int16
 
-	name []byte
+	name string
 }
 
 func (j *job) run() {
-	j.channel = make(chan []byte, j.workers)
+	j.channel = make(chan []byte, 128)
 	go func() {
 		defer close(j.channel)
 		j.reader()
 	}()
 
+	j.results = make([]map[uint64]*jobResult, 0, j.workers)
 	wg := sync.WaitGroup{}
 	for range j.workers {
 		result := make(map[uint64]*jobResult, 1024*8)
@@ -110,7 +117,7 @@ func (j *job) run() {
 func (j *job) reader() {
 	start := int64(0)
 	for {
-		buf := make([]byte, j.bufLen)
+		buf := bufferPool.Get().([]byte)
 		readLen, err := j.file.ReadAt(buf, start)
 		if err == io.EOF {
 			j.channel <- buf[:readLen]
@@ -129,7 +136,7 @@ func (j *job) reader() {
 }
 
 const (
-	// FNV-1 64-bit prime and offset basis
+	// FNV-1 64-bit prime and offset
 	FNVPrime  uint64 = 1099511628211
 	FNVOffset uint64 = 14695981039346656037
 )
@@ -138,12 +145,12 @@ func (j *job) worker(result map[uint64]*jobResult) {
 	for buf := range j.channel {
 		for i := 0; i < len(buf); i++ {
 			// parse city name
-			j := i
+			endi := i
 			h := FNVOffset
-			for buf[j] != ';' {
-				h ^= uint64(buf[j])
+			for buf[endi] != ';' {
+				h ^= uint64(buf[endi])
 				h *= FNVPrime
-				j++
+				endi++
 			}
 
 			// update map
@@ -152,17 +159,17 @@ func (j *job) worker(result map[uint64]*jobResult) {
 				cur = &jobResult{
 					max:  -1000,
 					min:  1000,
-					name: buf[i:j],
+					name: string(buf[i:endi]),
 				}
 				result[h] = cur
 			}
-			i = j + 1
+			i = endi + 1
 
 			// parse temperature
 			num := int16(0)
-			sign := int16(1)
+			negative := false
 			if buf[i] == '-' {
-				sign = -1
+				negative = true
 				i++
 			}
 			for buf[i] != '\n' {
@@ -171,12 +178,15 @@ func (j *job) worker(result map[uint64]*jobResult) {
 				}
 				i++
 			}
-			num *= sign
+			if negative {
+				num *= -1
+			}
 
 			cur.count += 1
 			cur.sum += int64(num)
 			cur.max = max(cur.max, num)
 			cur.min = min(cur.min, num)
 		}
+		bufferPool.Put(buf[:cap(buf)])
 	}
 }

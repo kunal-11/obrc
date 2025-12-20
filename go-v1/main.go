@@ -11,14 +11,6 @@ import (
 	"sync"
 )
 
-const BUF_LEN = 1024 * 1024 * 4
-
-var bufferPool = sync.Pool{
-	New: func() any {
-		return make([]byte, BUF_LEN)
-	},
-}
-
 func main() {
 	f, err := os.Create("./profdata")
 	if err != nil {
@@ -36,8 +28,9 @@ func main() {
 	defer file.Close()
 
 	j := job{
-		file:    file,
-		workers: runtime.NumCPU(),
+		file:      file,
+		workers:   runtime.NumCPU(),
+		bufferLen: 1024 * 1024 * 4,
 	}
 	j.run()
 	result := mergeMaps(j.results)
@@ -77,10 +70,15 @@ func mergeMaps(maps []map[uint64]*jobResult) map[uint64]*jobResult {
 
 type job struct {
 	// Options
-	file    *os.File
-	workers int
+	file      *os.File
+	workers   int
+	bufferLen int
 
-	channel chan []byte
+	// internal state
+	bufferPool *sync.Pool
+	channel    chan []byte
+
+	// output
 	results []map[uint64]*jobResult
 }
 
@@ -94,7 +92,13 @@ type jobResult struct {
 }
 
 func (j *job) run() {
-	j.channel = make(chan []byte, 128)
+	j.bufferPool = &sync.Pool{
+		New: func() any {
+			return make([]byte, j.bufferLen)
+		},
+	}
+
+	j.channel = make(chan []byte, 1024)
 	go func() {
 		defer close(j.channel)
 		j.reader()
@@ -105,11 +109,9 @@ func (j *job) run() {
 	for range j.workers {
 		result := make(map[uint64]*jobResult, 1024*8)
 		j.results = append(j.results, result)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			j.worker(result)
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -117,7 +119,7 @@ func (j *job) run() {
 func (j *job) reader() {
 	start := int64(0)
 	for {
-		buf := bufferPool.Get().([]byte)
+		buf := j.bufferPool.Get().([]byte)
 		readLen, err := j.file.ReadAt(buf, start)
 		if err == io.EOF {
 			j.channel <- buf[:readLen]
@@ -187,6 +189,6 @@ func (j *job) worker(result map[uint64]*jobResult) {
 			cur.max = max(cur.max, num)
 			cur.min = min(cur.min, num)
 		}
-		bufferPool.Put(buf[:cap(buf)])
+		j.bufferPool.Put(buf[:cap(buf)])
 	}
 }

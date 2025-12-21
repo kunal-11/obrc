@@ -6,104 +6,10 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"sort"
+	"slices"
+	"strings"
 	"sync"
 )
-
-var THREADS = runtime.NumCPU()
-
-type jobParts struct {
-	start, end int64
-}
-
-func findNewLine(file *os.File, offset int64) (int64, error) {
-	buf := make([]byte, 2048)
-	read, err := file.ReadAt(buf, offset)
-	if err != io.EOF && err != nil {
-		return 0, err
-	}
-	for i := range read {
-		if buf[i] == '\n' {
-			return offset + int64(i), nil
-		}
-	}
-	if err != io.EOF {
-		return 0, fmt.Errorf("newline not found after %v bytes", read)
-	}
-	return offset + int64(read), io.EOF
-}
-
-func calcParts(file *os.File, parts int) ([]jobParts, error) {
-	stats, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("error reading file stats: %w", err)
-	}
-	fileSize := stats.Size()
-	partLen := fileSize / int64(parts)
-
-	offsets := make([]jobParts, 0, parts)
-	offset := int64(0)
-	for range parts {
-		end, err := findNewLine(file, offset+partLen)
-		if err == io.EOF {
-			end = min(end, fileSize-1)
-		} else if err != nil {
-			return nil, err
-		}
-		offsets = append(offsets, jobParts{start: offset, end: end})
-		offset = end + 1
-	}
-	return offsets, nil
-}
-
-func calc(filePath string) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		fmt.Println("Error opening file: ", err)
-		os.Exit(1)
-	}
-	defer file.Close()
-
-	offsets, err := calcParts(file, THREADS)
-	if err != nil {
-		fmt.Println("Error splitting file: ", err)
-		os.Exit(1)
-	}
-	results := make([]map[string]*jobResult, 0, THREADS)
-
-	wg := &sync.WaitGroup{}
-	for _, offset := range offsets {
-		result := make(map[string]*jobResult, 128)
-		results = append(results, result)
-		job := &job{
-			f:      file,
-			start:  offset.start,
-			end:    offset.end,
-			result: result,
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			job.run()
-		}()
-	}
-	wg.Wait()
-	result := mergeMaps(results)
-
-	keys := make([]string, 0, len(result))
-	for k := range result {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	fmt.Print("{")
-	for _, city := range keys {
-		score := result[city]
-		mean := score.Sum / int64(score.Count)
-		fmt.Printf("%v=%v/%v/%v, ", city, float64(score.Min)/10, float64(mean)/10, float64(score.Max)/10)
-	}
-	fmt.Print("}")
-}
 
 func main() {
 	f, err := os.Create("./profdata")
@@ -114,5 +20,175 @@ func main() {
 	pprof.StartCPUProfile(f)
 	defer pprof.StopCPUProfile()
 
-	calc("./../data/measurements.txt")
+	file, err := os.Open("../data/measurements.txt")
+	if err != nil {
+		fmt.Print("error opening file: ", err)
+		os.Exit(1)
+	}
+	defer file.Close()
+
+	j := job{
+		file:      file,
+		workers:   runtime.NumCPU(),
+		bufferLen: 1024 * 1024 * 4,
+	}
+	j.run()
+	result := mergeMaps(j.results)
+
+	keys := make([]uint64, 0, len(result))
+	for k := range result {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(l, r uint64) int {
+		return strings.Compare(result[l].name, result[r].name)
+	})
+	fmt.Print("{")
+	for _, city := range keys {
+		score := result[city]
+		fmt.Printf("%s=%v/%v/%v, ", score.name, float32(score.min)/10, float32(score.sum/int64(score.count))/10, float32(score.max)/10)
+	}
+	fmt.Print("}")
+}
+
+func mergeMaps(maps []map[uint64]*jobResult) map[uint64]*jobResult {
+	res := maps[0]
+	for _, m := range maps[1:] {
+		for k, v := range m {
+			val, ok := res[k]
+			if !ok {
+				res[k] = v
+			} else {
+				val.count += v.count
+				val.sum += v.sum
+				val.max = max(val.max, v.max)
+				val.min = min(val.min, v.min)
+			}
+		}
+	}
+	return res
+}
+
+type job struct {
+	// Options
+	file      *os.File
+	workers   int
+	bufferLen int
+
+	// internal state
+	bufferPool *sync.Pool
+	channel    chan []byte
+
+	// output
+	results []map[uint64]*jobResult
+}
+
+type jobResult struct {
+	sum   int64
+	count int
+	min   int16
+	max   int16
+
+	name string
+}
+
+func (j *job) run() {
+	j.bufferPool = &sync.Pool{
+		New: func() any {
+			return make([]byte, j.bufferLen)
+		},
+	}
+
+	j.channel = make(chan []byte, 1024)
+	go func() {
+		defer close(j.channel)
+		j.reader()
+	}()
+
+	j.results = make([]map[uint64]*jobResult, 0, j.workers)
+	wg := sync.WaitGroup{}
+	for range j.workers {
+		result := make(map[uint64]*jobResult, 1024*8)
+		j.results = append(j.results, result)
+		wg.Go(func() {
+			j.worker(result)
+		})
+	}
+	wg.Wait()
+}
+
+func (j *job) reader() {
+	start := int64(0)
+	for {
+		buf := j.bufferPool.Get().([]byte)
+		readLen, err := j.file.ReadAt(buf, start)
+		if err == io.EOF {
+			j.channel <- buf[:readLen]
+			break
+		} else if err != nil {
+			fmt.Print("error reading file: ", err)
+			os.Exit(1)
+		}
+		i := readLen - 1
+		for i >= 0 && buf[i] != '\n' {
+			i--
+		}
+		start += int64(i + 1)
+		j.channel <- buf[:i+1]
+	}
+}
+
+const (
+	// FNV-1 64-bit prime and offset
+	FNVPrime  uint64 = 1099511628211
+	FNVOffset uint64 = 14695981039346656037
+)
+
+func (j *job) worker(result map[uint64]*jobResult) {
+	for buf := range j.channel {
+		for i := 0; i < len(buf); i++ {
+			// parse city name
+			endi := i
+			h := FNVOffset
+			for buf[endi] != ';' {
+				h ^= uint64(buf[endi])
+				h *= FNVPrime
+				endi++
+			}
+
+			// update map
+			cur, ok := result[h]
+			if !ok {
+				cur = &jobResult{
+					max:  -1000,
+					min:  1000,
+					name: string(buf[i:endi]),
+				}
+				result[h] = cur
+			}
+			i = endi + 1
+
+			// parse temperature
+			num := int16(0)
+			negative := false
+			if buf[i] == '-' {
+				negative = true
+				i++
+			}
+			for buf[i] != '\n' {
+				if buf[i] != '.' {
+					num = num*10 + int16(buf[i]-'0')
+				}
+				i++
+			}
+			if negative {
+				num *= -1
+			}
+
+			cur.count += 1
+			cur.sum += int64(num)
+			cur.max = max(cur.max, num)
+			cur.min = min(cur.min, num)
+		}
+		j.bufferPool.Put(buf[:cap(buf)])
+	}
 }
